@@ -59,7 +59,8 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-        if (!ongoingWindow.acquire(deadline - now() - requestAverageProcessingTime.toMillis(), TimeUnit.MILLISECONDS)) {
+        val processingTimer: Long = (requestAverageProcessingTime.toMillis() * 1.5).toLong()
+        if (!ongoingWindow.acquire(deadline - now() - processingTimer, TimeUnit.MILLISECONDS)) {
             logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId)
@@ -69,7 +70,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            if (!rateLimiter.tickBlocking(deadline - now() - requestAverageProcessingTime.toMillis(), TimeUnit.MILLISECONDS)) {
+            if (!rateLimiter.tickBlocking(deadline - now() - processingTimer, TimeUnit.MILLISECONDS)) {
                 // сюда ту же метрику таймаута
                 logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
                 paymentESService.update(paymentId) {
