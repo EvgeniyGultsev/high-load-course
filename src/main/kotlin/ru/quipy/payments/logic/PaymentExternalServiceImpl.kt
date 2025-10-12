@@ -60,8 +60,6 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-        if (!ongoingWindow.acquire(deadline - now() - requestAverageProcessingTime.toMillis(), TimeUnit.MILLISECONDS)) {
-            metricsCollector.failedRequestInc(accountName)
         val processingTimer: Long = (requestAverageProcessingTime.toMillis() * 1.5).toLong()
         if (!ongoingWindow.acquire(deadline - now() - processingTimer, TimeUnit.MILLISECONDS)) {
             logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
