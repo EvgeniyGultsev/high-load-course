@@ -9,10 +9,12 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
+import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -22,6 +24,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
 ) : PaymentExternalSystemAdapter {
+
+    private val metricsCollector = MetricsCollector()
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -37,6 +41,9 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+
+    // Кейс 3 Если поставить окно больше, например 14, будет лететь parallel_request_limit_breached, но он почему-то не считает
+    // их за неукспешное выпольнение, и тогда будет 90 процентов успеха и нормальный income. Но мы так делать не будем - это неправильно
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val client = OkHttpClient.Builder().build()
@@ -53,10 +60,27 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        val processingTimer: Long = (requestAverageProcessingTime.toMillis() * 1.5).toLong()
+        if (!ongoingWindow.acquire(deadline - now() - processingTimer, TimeUnit.MILLISECONDS)) {
+            logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId)
+            }
 
-        ongoingWindow.acquire()
-        rateLimiter.tickBlocking()
+            return
+        }
+
         try {
+            if (!rateLimiter.tickBlocking(deadline - now() - processingTimer, TimeUnit.MILLISECONDS)) {
+                // сюда ту же метрику таймаута
+                logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId)
+                }
+
+                return
+            }
+
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -70,9 +94,13 @@ class PaymentExternalSystemAdapterImpl(
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                 }
 
-                ongoingWindow.release()
-
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                if (body.result) {
+                    metricsCollector.successfulRequestInc(accountName)
+                }
+                else {
+                    metricsCollector.failedRequestExternalInc(accountName)
+                }
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
@@ -81,7 +109,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: Exception) {
-            ongoingWindow.release()
+            metricsCollector.failedRequestExternalInc(accountName)
 
             when (e) {
                 is SocketTimeoutException -> {
@@ -99,6 +127,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            ongoingWindow.release()
         }
     }
 
@@ -107,7 +137,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
-
 }
 
 public fun now() = System.currentTimeMillis()
