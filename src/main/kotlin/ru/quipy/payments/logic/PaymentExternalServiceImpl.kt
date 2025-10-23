@@ -6,7 +6,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
+import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
@@ -19,6 +22,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val metricsCollector: MetricsCollector
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -30,9 +34,13 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
+    private val requestAverageProcessingTime = properties.averageProcessingTime.toMillis()
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+
+    private val ongoingWindow = OngoingWindow(parallelRequests, true)
 
     private val client = OkHttpClient.Builder().build()
 
@@ -50,6 +58,9 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
+            ongoingWindow.acquire()
+            rateLimiter.tickBlocking()
+
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -64,6 +75,12 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                if (body.result) {
+                    metricsCollector.successfulRequestInc(accountName)
+                }
+                else {
+                    metricsCollector.failedRequestExternalInc(accountName)
+                }
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
@@ -72,6 +89,8 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } catch (e: Exception) {
+            metricsCollector.failedRequestExternalInc(accountName)
+
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
@@ -88,6 +107,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            ongoingWindow.release()
         }
     }
 
@@ -97,6 +118,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    override fun maxRateLimit() = properties.rateLimitPerSec
 }
 
 public fun now() = System.currentTimeMillis()
