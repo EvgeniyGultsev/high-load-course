@@ -18,7 +18,8 @@ import java.util.concurrent.TimeUnit
 @Service
 class OrderPayer(
     private val metricsCollector: MetricsCollector,
-    private val paymentService: PaymentService
+    private val paymentService: PaymentService,
+    private val avgTimeKeeper: AverageTimeKeeper
 ) {
 
     companion object {
@@ -27,8 +28,6 @@ class OrderPayer(
 
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
-
-    private var avgTimeKeeper = AverageTimeKeeper()
 
     private val paymentExecutor: ThreadPoolExecutor
 
@@ -72,8 +71,8 @@ class OrderPayer(
         val createdAt = System.currentTimeMillis()
         val averageProcessingTime = avgTimeKeeper.getAverage()
 
-        val maxProcessingTime = averageProcessingTime * 1.5
-
+        val maxProcessingTime = averageProcessingTime + avgTimeKeeper.calculateStandardDeviation()
+        println(maxProcessingTime-averageProcessingTime)
         val queueProcessingTime = (paymentTaskQueue.size + backgroundWorkers) * maxProcessingTime / backgroundWorkers
 
         if (now() + queueProcessingTime > deadline) {

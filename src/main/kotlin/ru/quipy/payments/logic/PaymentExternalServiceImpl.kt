@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.AverageTimeKeeper
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -22,7 +23,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val metricsCollector: MetricsCollector
+    private val metricsCollector: MetricsCollector,
+    private val timeKeeper: AverageTimeKeeper
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -66,6 +68,7 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            val beforeCallTime = now();
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -73,6 +76,8 @@ class PaymentExternalSystemAdapterImpl(
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                 }
+
+                timeKeeper.recordExternalServiceProcessingTime(now() - beforeCallTime)
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
                 if (body.result) {
