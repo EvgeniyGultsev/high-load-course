@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -48,7 +49,7 @@ class PaymentExternalSystemAdapterImpl(
     private val responsesListSize = 1000
     private val responses = LinkedBlockingDeque<Long>(responsesListSize)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -74,7 +75,9 @@ class PaymentExternalSystemAdapterImpl(
                 retryable = false
                 val client = buildClientWithTimeout(deadline, 0.95)
                 try{
-                    client.newCall(request).execute().use { response ->
+                    withContext(Dispatchers.IO) {
+                        client.newCall(request).execute()
+                    }.use { response ->
                         addResponseTime(response)
 
                         val body = try {

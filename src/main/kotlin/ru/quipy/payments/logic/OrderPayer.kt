@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import kotlinx.coroutines.*
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -11,9 +12,7 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.channels.Channel
 
 @Service
 class OrderPayer(
@@ -30,51 +29,37 @@ class OrderPayer(
 
     private var avgTimeKeeper = AverageTimeKeeper()
 
-    private val paymentExecutor: ThreadPoolExecutor
-
-    private val paymentTaskQueue = LinkedBlockingQueue<Payment>()
+    private val paymentTaskQueue = Channel<Payment>(Channel.UNLIMITED)
     private val backgroundWorkers = getMaxRateLimit()
+    private val paymentScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     init {
-        val queue = LinkedBlockingQueue<Runnable>(8000)
-        metricsCollector.requestsQueueSizeRegister(queue);
-
-        paymentExecutor = ThreadPoolExecutor(
-            50,
-            100,
-            0L,
-            TimeUnit.MILLISECONDS,
-            queue,
-            NamedThreadFactory("payment-submission-executor"),
-            CallerBlockingRejectedExecutionHandler()
-        ).apply {
-            repeat(backgroundWorkers) {
-                submit {
-                    while (!Thread.currentThread().isInterrupted) {
-                        try {
-                            val task = paymentTaskQueue.take()
-                            val taskStartedAt = now()
-                            processInternal(task)
-                            avgTimeKeeper.record(now() - taskStartedAt)
-                        } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt()
+        repeat(backgroundWorkers) {
+            paymentScope.launch {
+                while (isActive) {
+                    try {
+                        val task = paymentTaskQueue.receive()
+                        val taskStartedAt = now()
+                        processInternal(task)
+                        avgTimeKeeper.record(now() - taskStartedAt)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) {
                             break
-                        } catch (e: Exception) {
-                            logger.error("Error processing payment task", e)
                         }
+                        logger.error("Error processing payment task", e)
                     }
                 }
             }
         }
     }
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
+    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
         val averageProcessingTime = avgTimeKeeper.getAverage()
 
         val maxProcessingTime = averageProcessingTime * 1
 
-        val queueProcessingTime = (paymentTaskQueue.size + backgroundWorkers) * maxProcessingTime / backgroundWorkers
+        val queueProcessingTime = backgroundWorkers * maxProcessingTime / backgroundWorkers
 
         if (now() + queueProcessingTime > deadline) {
             logger.warn("Payment $paymentId for order $orderId not created (too many requests)")
@@ -83,11 +68,11 @@ class OrderPayer(
             return null
         }
 
-        paymentTaskQueue.put(Payment(orderId, amount, paymentId, deadline, createdAt))
+        paymentTaskQueue.send(Payment(orderId, amount, paymentId, deadline, createdAt))
         return createdAt
     }
 
-    private fun processInternal(payment: Payment){
+    private suspend fun processInternal(payment: Payment){
         val createdEvent = paymentESService.create {
             it.create(
                 payment.paymentId,
