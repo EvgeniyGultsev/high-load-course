@@ -12,12 +12,12 @@ class AuthController {
     val logger: Logger = LoggerFactory.getLogger(AuthController::class.java)
 
     @PostMapping("/authentication")
-    fun authentication(@RequestBody jsonString: String): TokenResponse {
+    suspend fun authentication(@RequestBody jsonString: String): TokenResponse {
         return TokenResponse("accessToken", "refreshToken")
     }
 
     @PostMapping("/authentication/refresh")
-    fun authenticationRefresh(@RequestBody jsonString: String): TokenResponse {
+    suspend fun authenticationRefresh(@RequestBody jsonString: String): TokenResponse {
         return TokenResponse("accessToken", "refreshToken")
     }
 

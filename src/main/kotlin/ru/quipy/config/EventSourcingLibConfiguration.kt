@@ -4,8 +4,8 @@ import jakarta.annotation.PostConstruct
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.boot.web.embedded.jetty.JettyReactiveWebServerFactory
 import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
-import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingServiceFactory
@@ -67,14 +67,14 @@ class EventSourcingLibConfiguration {
     }
 
     @Bean // hack Jetty to tweak the number of possible https2 streams
-    fun jettyServerCustomizer(): JettyServletWebServerFactory {
-        val jettyServletWebServerFactory = JettyServletWebServerFactory()
+    fun jettyReactiveServerCustomizer(): JettyReactiveWebServerFactory {
+        val factory = JettyReactiveWebServerFactory()
 
         val c = JettyServerCustomizer {
             (it.connectors[0].getConnectionFactory("h2c") as HTTP2CServerConnectionFactory).maxConcurrentStreams = 10_000_000
         }
 
-        jettyServletWebServerFactory.serverCustomizers.add(c)
-        return jettyServletWebServerFactory
+        factory.addServerCustomizers(c)
+        return factory
     }
 }
