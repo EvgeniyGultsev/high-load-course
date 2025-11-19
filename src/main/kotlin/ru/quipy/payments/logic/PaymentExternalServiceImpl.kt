@@ -153,7 +153,11 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     fun buildTimeout(deadline: Long, quantilePercent: Double): Long {
-        val timeout = countQuantileTime(quantilePercent).coerceIn(requestAverageProcessingTime, deadline - now())
+        val remainingTime = deadline - now()
+        val minTimeout = requestAverageProcessingTime
+        val maxTimeout = if (remainingTime > minTimeout) remainingTime else minTimeout
+        
+        val timeout = countQuantileTime(quantilePercent).coerceIn(minTimeout, maxTimeout)
         return (timeout * 1.5).toLong()
     }
 
