@@ -11,11 +11,6 @@ import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
 import kotlinx.coroutines.channels.Channel
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.NamedThreadFactory
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 
 @Service
 class OrderPayer(
@@ -35,36 +30,20 @@ class OrderPayer(
     private val paymentTaskQueue = Channel<Payment>(Channel.UNLIMITED)
     private val backgroundWorkers = getMaxRateLimit()
     private val paymentScope = CoroutineScope(Dispatchers.IO)
-    private val paymentExecutor: ThreadPoolExecutor
 
     init {
-        val queue = LinkedBlockingQueue<Runnable>(8000)
-        metricsCollector.requestsQueueSizeRegister(queue);
-
-        paymentExecutor = ThreadPoolExecutor(
-            50,
-            100,
-            0L,
-            TimeUnit.MILLISECONDS,
-            queue,
-            NamedThreadFactory("payment-submission-executor"),
-            CallerBlockingRejectedExecutionHandler()
-        ).apply {
-            repeat(backgroundWorkers) {
-                submit {
-                    while (!Thread.currentThread().isInterrupted) {
-                        try {
-                            val task = paymentTaskQueue.take()
-                            val taskStartedAt = now()
-                            processInternal(task)
-                            avgTimeKeeper.record(now() - taskStartedAt)
-                        } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        } catch (e: Exception) {
-                            logger.error("Error processing payment task", e)
-                        }
+        paymentScope.launch {
+            while (isActive) {
+                try {
+                    val task = paymentTaskQueue.receive()
+                    val taskStartedAt = now()
+                    processInternal(task)
+                    avgTimeKeeper.record(now() - taskStartedAt)
+                } catch (e: Exception) {
+                    if (e is CancellationException) {
+                        break
                     }
+                    logger.error("Error processing payment task", e)
                 }
             }
         }
