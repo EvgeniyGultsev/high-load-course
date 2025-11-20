@@ -64,7 +64,7 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.acquire()
             var retryable = true
             while (retryable) {
-                //rateLimiter.tickSuspend()
+                rateLimiter.tickSuspend()
                 retryable = false
                 val timeout = buildTimeout(deadline, 0.95)
                 val startTime = System.currentTimeMillis()
@@ -156,7 +156,7 @@ class PaymentExternalSystemAdapterImpl(
         val maxTimeout = if (remainingTime > minTimeout) remainingTime else minTimeout
         
         val timeout = countQuantileTime(quantilePercent).coerceIn(minTimeout, maxTimeout)
-        return (timeout * 1.5).toLong()
+        return (timeout * 2)
     }
 
     fun countQuantileTime(quantilePercent: Double): Long {

@@ -49,7 +49,7 @@ class PaymentAccountsConfig(
     @Bean
     fun webClient(): WebClient {
         val connectionProvider = ConnectionProvider.builder("payment-client")
-            .maxConnections(1000)
+            .maxConnections(10500)
             .maxIdleTime(Duration.ofSeconds(20))
             .maxLifeTime(Duration.ofMinutes(10))
             .pendingAcquireTimeout(Duration.ofSeconds(60))
