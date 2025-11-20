@@ -64,7 +64,7 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.acquire()
             var retryable = true
             while (retryable) {
-                //rateLimiter.tickSuspend()
+                rateLimiter.tickSuspend()
                 retryable = false
                 val timeout = buildTimeout(deadline, 0.95)
                 val startTime = System.currentTimeMillis()

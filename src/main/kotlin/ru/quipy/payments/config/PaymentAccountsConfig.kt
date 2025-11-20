@@ -17,6 +17,7 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
+import java.io.IO.println
 import java.net.URI
 import java.net.http.HttpClient as JavaHttpClient
 import java.net.http.HttpRequest
