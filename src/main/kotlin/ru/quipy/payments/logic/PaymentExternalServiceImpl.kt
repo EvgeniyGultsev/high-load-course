@@ -2,9 +2,13 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.ratelimiter.RateLimiter
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
+import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
+import reactor.core.publisher.Mono
+import reactor.core.scheduler.Schedulers
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -38,7 +42,22 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateLimiterConfig = io.github.resilience4j.ratelimiter.RateLimiterConfig
+        .custom()
+        .timeoutDuration(Duration.ofSeconds(1))
+        .limitRefreshPeriod(Duration.ofMillis(100))
+        .limitForPeriod(110)
+        .build()
+
+    private val rateLimiter = RateLimiter.of("$accountName-rate-limiter", rateLimiterConfig)
+
+    private inline fun <reified T> rateLimited(mono: Mono<T>): Mono<T> =
+        Mono.fromCallable { rateLimiter.acquirePermission() }
+            .subscribeOn(Schedulers.boundedElastic())
+            .flatMap { permitted ->
+                if (permitted) mono
+                else Mono.error(IllegalArgumentException("Rate limit exceeded"))
+            }
 
     private val ongoingWindow = OngoingWindow(parallelRequests, true)
 
@@ -69,29 +88,21 @@ class PaymentExternalSystemAdapterImpl(
                 val timeout = buildTimeout(deadline, 0.95)
                 val startTime = System.currentTimeMillis()
                 try {
-                    val responseBody = webClient.post()
+                    val request = webClient
+                        .post()
                         .uri(url)
-                        .bodyValue("")
+                        .accept(MediaType.APPLICATION_JSON)
                         .retrieve()
-                        .onStatus({ status -> status.isError }) { response ->
-                            response.createException()
-                        }
-                        .bodyToMono(String::class.java)
-                        .timeout(Duration.ofMillis(timeout))
+                        .toEntity(ExternalSysResponse::class.java)
+
+                    val response = rateLimited(request)
                         .awaitSingle()
 
                     val executionTime = System.currentTimeMillis() - startTime
                     addResponseTime(executionTime)
 
-                    val body = try {
-                        mapper.readValue(responseBody, ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, response parsing failed: ${e.message}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    if (body.result) {
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${response.body!!.result}, message: ${response.body!!.message}")
+                    if (response.body!!.result) {
                         metricsCollector.successfulRequestInc(accountName)
                     }
                     else {
@@ -101,10 +112,10 @@ class PaymentExternalSystemAdapterImpl(
                     // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                     // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                     paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        it.logProcessing(response.body!!.result, now(), transactionId, reason = response.body!!.message)
                     }
 
-                    if (!body.result && deadline - now() > requestAverageProcessingTime) {
+                    if (!response.body!!.result && deadline - now() > requestAverageProcessingTime) {
                         retryable = true
                         metricsCollector.incRetryCount(accountName)
                     }

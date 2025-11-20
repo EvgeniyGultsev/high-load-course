@@ -66,7 +66,7 @@ class EventSourcingLibConfiguration {
         }
     }
 
-    @Bean // hack Jetty to tweak the number of possible https2 streams
+    @Bean
     fun jettyReactiveServerCustomizer(): JettyReactiveWebServerFactory {
         val factory = JettyReactiveWebServerFactory()
 
