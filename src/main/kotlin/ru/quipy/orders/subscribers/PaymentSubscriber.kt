@@ -1,11 +1,12 @@
 package ru.quipy.orders.subscribers
 
 import jakarta.annotation.PostConstruct
+import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.OnlineShopApplication.Companion.appExecutor
+import ru.quipy.OnlineShopApplication.Companion.appScope
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.api.PaymentProcessedEvent
@@ -34,7 +35,7 @@ class PaymentSubscriber {
             retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)
         ) {
             `when`(PaymentProcessedEvent::class) { event ->
-                appExecutor.submit {
+                appScope.launch {
                     logger.trace(
                         "Payment results. OrderId ${event.orderId}, succeeded: ${event.success}, txId: ${event.transactionId}, reason: ${event.reason}, duration: ${
                             Duration.ofMillis(

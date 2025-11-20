@@ -2,7 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.*
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
 import org.springframework.web.reactive.function.client.WebClient
@@ -13,10 +12,9 @@ import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
-import java.util.*
+import java.util.UUID
 import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeoutException
-
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -66,7 +64,7 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.acquire()
             var retryable = true
             while (retryable) {
-                rateLimiter.tickBlocking()
+                //rateLimiter.tickSuspend()
                 retryable = false
                 val timeout = buildTimeout(deadline, 0.95)
                 val startTime = System.currentTimeMillis()
