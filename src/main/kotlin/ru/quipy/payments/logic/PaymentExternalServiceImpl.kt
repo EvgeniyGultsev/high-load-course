@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.ratelimiter.RateLimiter
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
 import org.springframework.http.MediaType
@@ -41,10 +42,18 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec).toLong())
+    private val rateLimiterConfig = io.github.resilience4j.ratelimiter.RateLimiterConfig
+        .custom()
+        .timeoutDuration(Duration.ofSeconds(1))
+        .limitRefreshPeriod(Duration.ofMillis(100))
+        .limitForPeriod(110)
+        .build()
+
+
+    private val rateLimiter = RateLimiter.of("$accountName-rate-limiter", rateLimiterConfig)
 
     private inline fun <reified T> rateLimited(mono: Mono<T>): Mono<T> =
-        Mono.fromCallable { rateLimiter.tick() }
+        Mono.fromCallable { rateLimiter.acquirePermission() }
             .subscribeOn(Schedulers.boundedElastic())
             .flatMap { permitted ->
                 if (permitted) mono
