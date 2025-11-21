@@ -23,7 +23,10 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
-    private val executorScope = CoroutineScope(Dispatchers.IO)
+    @OptIn(DelicateCoroutinesApi::class)
+    private val executorScope = CoroutineScope(
+        newFixedThreadPoolContext(200, "io_pool")
+    )
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
