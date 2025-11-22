@@ -1,18 +1,13 @@
 package ru.quipy.payments.logic
 
-import io.netty.handler.timeout.ReadTimeoutException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
 import org.springframework.web.reactive.function.client.WebClient
-import reactor.netty.http.client.PrematureCloseException
-import reactor.util.retry.Retry
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
-import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
@@ -63,61 +58,39 @@ class PaymentExternalSystemAdapterImpl(
             val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
             ongoingWindow.acquire()
-            var retryable = true
             var attempts = 0
-            while (retryable && attempts < 5) {
+            while (attempts < 5) {
                 //rateLimiter.tickSuspend()
-                retryable = false
                 attempts++
-                val timeout = buildTimeout(deadline, 0.95)
-                val startTime = System.currentTimeMillis()
-                try {
-                    val body = webClient.post()
-                        .uri(url)
-                        .bodyValue("")
-                        .retrieve()
-                        .onStatus({ status -> status.isError }) { response ->
-                            response.createException()
-                        }
-                        .bodyToMono(ExternalSysResponse::class.java)
-                        .timeout(Duration.ofMillis(timeout))
-                        .awaitSingle()
+                val body = webClient.post()
+                    .uri(url)
+                    .bodyValue("")
+                    .retrieve()
+                    .onStatus({ status -> status.isError }) { response ->
+                        response.createException()
+                    }
+                    .bodyToMono(ExternalSysResponse::class.java)
+                    .awaitSingle()
 
-                    val executionTime = System.currentTimeMillis() - startTime
-                    addResponseTime(executionTime)
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                if (body.result) {
+                    metricsCollector.successfulRequestInc(accountName)
+                }
+                else {
+                    metricsCollector.failedRequestExternalInc(accountName)
+                }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    if (body.result) {
-                        metricsCollector.successfulRequestInc(accountName)
-                    }
-                    else {
-                        metricsCollector.failedRequestExternalInc(accountName)
-                    }
+                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
 
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
-
-                    if (!body.result && deadline - now() > requestAverageProcessingTime) {
-                        retryable = true
-                        metricsCollector.incRetryCount(accountName)
-                    }
-                } catch (e: Exception) {
-                    val executionTime = System.currentTimeMillis() - startTime
-                    addResponseTime(executionTime)
-                    
-                    if (deadline - now() > requestAverageProcessingTime && attempts < 5) {
-                        retryable = true
-                        metricsCollector.incRetryCount(accountName)
-                        delay(50)
-                    }
-                    else{
-                        throw e
-                    }
+                if (!body.result && deadline - now() > requestAverageProcessingTime) {
+                    metricsCollector.incRetryCount(accountName)
                 }
             }
+            logger.warn("[$accountName] Payment failed after $attempts attempts for txId: $transactionId, payment: $paymentId")
         } catch (e: Exception) {
             metricsCollector.failedRequestExternalInc(accountName)
 
