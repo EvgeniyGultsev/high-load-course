@@ -1,6 +1,6 @@
 package ru.quipy.common.utils
 
-import java.util.concurrent.Semaphore
+import kotlinx.coroutines.sync.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -8,18 +8,15 @@ class OngoingWindow(
     maxWinSize: Int,
     fair: Boolean
 ) {
-    private val window = Semaphore(maxWinSize, fair)
+    private val semaphore = Semaphore(maxWinSize)
 
-    fun acquire() {
-        window.acquire()
+    suspend fun acquire() {
+        semaphore.acquire()
     }
 
-    fun acquire(timeout: Long, unit: TimeUnit) : Boolean =
-        window.tryAcquire(unit.toMillis(timeout), TimeUnit.MILLISECONDS);
+    fun release() = semaphore.release()
 
-    fun release() = window.release()
-
-    fun awaitingQueueSize() = window.queueLength
+    fun awaitingQueueSize() = 0
 }
 
 class NonBlockingOngoingWindow(

@@ -17,10 +17,6 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
-import java.net.URI
-import java.net.http.HttpClient as JavaHttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 
@@ -30,7 +26,6 @@ class PaymentAccountsConfig(
     private val metricsCollector: MetricsCollector
 ) {
     companion object {
-        private val javaClient = JavaHttpClient.newBuilder().build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
     }
 
@@ -49,11 +44,13 @@ class PaymentAccountsConfig(
     @Bean
     fun webClient(): WebClient {
         val connectionProvider = ConnectionProvider.builder("payment-client")
-            .maxConnections(10000)
-            .maxIdleTime(Duration.ofSeconds(20))
-            .maxLifeTime(Duration.ofMinutes(10))
+            .maxConnections(50000)
+            .pendingAcquireMaxCount(-1)
+            .maxIdleTime(Duration.ofSeconds(3))
+            .maxLifeTime(Duration.ofMinutes(1))
+            .lifo()
             .pendingAcquireTimeout(Duration.ofSeconds(60))
-            .evictInBackground(Duration.ofSeconds(120))
+            .evictInBackground(Duration.ofSeconds(30))
             .build()
         
         val httpClient = HttpClient.create(connectionProvider)
@@ -76,16 +73,15 @@ class PaymentAccountsConfig(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         webClient: WebClient
     ): List<PaymentExternalSystemAdapter> {
-        val request = HttpRequest.newBuilder()
-            .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
-            .GET()
-            .build()
-
-        val resp = javaClient.send(request, HttpResponse.BodyHandlers.ofString())
+        val accountsString = webClient.get()
+            .uri("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token")
+            .retrieve()
+            .bodyToMono(String::class.java)
+            .block() ?: ""
 
         println("\nPayment accounts list:")
         return mapper.readValue<List<PaymentAccountProperties>>(
-            resp.body(),
+            accountsString,
             mapper.typeFactory.constructCollectionType(List::class.java, PaymentAccountProperties::class.java)
         )
             .filter { it.accountName in allowedAccounts }

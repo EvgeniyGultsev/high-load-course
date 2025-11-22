@@ -1,15 +1,17 @@
 package ru.quipy.payments.logic
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.netty.handler.timeout.ReadTimeoutException
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
 import org.springframework.web.reactive.function.client.WebClient
+import reactor.netty.http.client.PrematureCloseException
+import reactor.util.retry.Retry
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
@@ -28,8 +30,6 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
-        val mapper = ObjectMapper().registerKotlinModule()
     }
 
     private val serviceName = properties.serviceName
@@ -63,32 +63,31 @@ class PaymentExternalSystemAdapterImpl(
 
             ongoingWindow.acquire()
             var retryable = true
-            while (retryable) {
+            var attempts = 0
+            while (retryable && attempts < 5) {
                 //rateLimiter.tickSuspend()
                 retryable = false
+                attempts++
                 val timeout = buildTimeout(deadline, 0.95)
                 val startTime = System.currentTimeMillis()
                 try {
-                    val responseBody = webClient.post()
+                    val body = webClient.post()
                         .uri(url)
                         .bodyValue("")
                         .retrieve()
                         .onStatus({ status -> status.isError }) { response ->
                             response.createException()
                         }
-                        .bodyToMono(String::class.java)
+                        .bodyToMono(ExternalSysResponse::class.java)
                         .timeout(Duration.ofMillis(timeout))
+                        .retryWhen(
+                            Retry.backoff(3, Duration.ofMillis(50))
+                                .filter { it is IOException || it is PrematureCloseException || it is ReadTimeoutException }
+                        )
                         .awaitSingle()
 
                     val executionTime = System.currentTimeMillis() - startTime
                     addResponseTime(executionTime)
-
-                    val body = try {
-                        mapper.readValue(responseBody, ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, response parsing failed: ${e.message}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
 
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
                     if (body.result) {
@@ -120,6 +119,9 @@ class PaymentExternalSystemAdapterImpl(
                         throw e
                     }
                 }
+            }
+            if (retryable && attempts >= 5) {
+                 logger.warn("[$accountName] Payment failed after $attempts attempts for txId: $transactionId, payment: $paymentId")
             }
         } catch (e: Exception) {
             metricsCollector.failedRequestExternalInc(accountName)
