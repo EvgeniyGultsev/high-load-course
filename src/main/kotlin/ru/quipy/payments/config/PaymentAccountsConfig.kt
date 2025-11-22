@@ -47,21 +47,6 @@ class PaymentAccountsConfig(
     lateinit var allowedAccounts: List<String>
 
     @Bean
-    fun webClient(): WebClient {
-        val connectionProvider = ConnectionProvider
-            .builder("connection_provider")
-            .maxConnections(10500)
-            .build()
-        
-        val httpClient = HttpClient.create(connectionProvider)
-        
-        return WebClient
-            .builder()
-            .clientConnector(ReactorClientHttpConnector(httpClient))
-            .build()
-    }
-
-    @Bean
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         webClient: WebClient

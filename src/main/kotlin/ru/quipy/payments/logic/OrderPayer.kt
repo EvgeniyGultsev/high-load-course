@@ -18,6 +18,7 @@ class OrderPayer(
 ) {
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+        private const val THREAD_COUNT = 200
     }
 
     @Autowired
@@ -25,10 +26,10 @@ class OrderPayer(
 
     @OptIn(DelicateCoroutinesApi::class)
     private val executorScope = CoroutineScope(
-        newFixedThreadPoolContext(200, "io_pool")
+        newFixedThreadPoolContext(THREAD_COUNT, "io_pool")
     )
 
-    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
+    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
         executorScope.launch {
@@ -47,6 +48,4 @@ class OrderPayer(
 
         return createdAt
     }
-
-    fun getMaxRateLimit() = paymentService.getMaxRateLimit()
 }
