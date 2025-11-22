@@ -34,11 +34,12 @@ class WebClientConfig {
 
         val httpClient = HttpClient
             .create(connectionProvider)
-            .protocol(HttpProtocol.H2C)
+            //.protocol(HttpProtocol.H2C)
 
         return WebClient
             .builder()
             .clientConnector(ReactorClientHttpConnector(httpClient))
+            // .filter(rateLimitingFilter(SlidingWindowRateLimiter(1100)))
             .build()
     }
 }
