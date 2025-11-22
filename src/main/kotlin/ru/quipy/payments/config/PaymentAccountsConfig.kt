@@ -48,25 +48,15 @@ class PaymentAccountsConfig(
 
     @Bean
     fun webClient(): WebClient {
-        val connectionProvider = ConnectionProvider.builder("payment-client")
+        val connectionProvider = ConnectionProvider
+            .builder("payment-client")
             .maxConnections(10500)
-            .maxIdleTime(Duration.ofSeconds(20))
-            .maxLifeTime(Duration.ofMinutes(10))
-            .pendingAcquireTimeout(Duration.ofSeconds(60))
-            .evictInBackground(Duration.ofSeconds(120))
             .build()
         
         val httpClient = HttpClient.create(connectionProvider)
-            .responseTimeout(Duration.ofSeconds(300))
-            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 60000)
-            .option(ChannelOption.SO_KEEPALIVE, true)
-            .option(ChannelOption.TCP_NODELAY, true)
-            .doOnConnected { conn ->
-                conn.addHandlerLast(ReadTimeoutHandler(300))
-                conn.addHandlerLast(WriteTimeoutHandler(60))
-            }
         
-        return WebClient.builder()
+        return WebClient
+            .builder()
             .clientConnector(ReactorClientHttpConnector(httpClient))
             .build()
     }

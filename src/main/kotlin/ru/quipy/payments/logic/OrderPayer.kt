@@ -25,69 +25,27 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
-    private var avgTimeKeeper = AverageTimeKeeper()
-
-    private val paymentTaskQueue = Channel<Payment>(Channel.UNLIMITED)
-    private val backgroundWorkers = getMaxRateLimit()
     private val paymentScope = CoroutineScope(Dispatchers.IO)
-
-    init {
-        paymentScope.launch {
-            while (isActive) {
-                try {
-                    val task = paymentTaskQueue.receive()
-                    val taskStartedAt = now()
-                    processInternal(task)
-                    avgTimeKeeper.record(now() - taskStartedAt)
-                } catch (e: Exception) {
-                    if (e is CancellationException) {
-                        break
-                    }
-                    logger.error("Error processing payment task", e)
-                }
-            }
-        }
-    }
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
-        val averageProcessingTime = avgTimeKeeper.getAverage()
 
-        val maxProcessingTime = averageProcessingTime * 1
+        paymentScope.launch {
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
+            }
 
-        val queueProcessingTime = backgroundWorkers * maxProcessingTime / backgroundWorkers
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-        if (now() + queueProcessingTime > deadline) {
-            logger.warn("Payment $paymentId for order $orderId not created (too many requests)")
-            metricsCollector.status429RequestInc()
-
-            return null
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
 
-        paymentTaskQueue.send(Payment(orderId, amount, paymentId, deadline, createdAt))
         return createdAt
     }
 
-    private suspend fun processInternal(payment: Payment){
-        val createdEvent = paymentESService.create {
-            it.create(
-                payment.paymentId,
-                payment.orderId,
-                payment.amount
-            )
-        }
-
-        logger.trace("Payment ${createdEvent.paymentId} for order $payment.orderId created.")
-
-        paymentService.submitPaymentRequest(payment.paymentId, payment.amount, payment.createdAt, payment.deadline)
-    }
-
-    private data class Payment(
-        val orderId: UUID,
-        val amount: Int,
-        val paymentId: UUID,
-        val deadline: Long,
-        val createdAt: Long
-    )
     fun getMaxRateLimit() = paymentService.getMaxRateLimit()
 }

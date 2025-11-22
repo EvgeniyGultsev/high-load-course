@@ -42,7 +42,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val ongoingWindow = OngoingWindow(parallelRequests, true)
 
-    private val responsesListSize = 1000
+    private val responsesListSize = 10000
     private val responses = LinkedBlockingDeque<Long>(responsesListSize)
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -59,19 +59,20 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-            val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+            val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&"
 
             ongoingWindow.acquire()
             var retryable = true
             while (retryable) {
-                rateLimiter.tickSuspend()
+                rateLimiter.tickBlocking()
                 retryable = false
-                val timeout = buildTimeout(deadline, 0.95)
+                val timeout = buildTimeout(deadline, 0.99)
                 val startTime = System.currentTimeMillis()
                 try {
                     val responseBody = webClient.post()
                         .uri(url)
-                        .bodyValue("")
+                        .header("deadline", "$deadline")
+                        .header("timeout", "$timeout")
                         .retrieve()
                         .onStatus({ status -> status.isError }) { response ->
                             response.createException()
@@ -156,7 +157,7 @@ class PaymentExternalSystemAdapterImpl(
         val maxTimeout = if (remainingTime > minTimeout) remainingTime else minTimeout
         
         val timeout = countQuantileTime(quantilePercent).coerceIn(minTimeout, maxTimeout)
-        return (timeout * 2)
+        return timeout
     }
 
     fun countQuantileTime(quantilePercent: Double): Long {
@@ -165,8 +166,8 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val copy = responses.toList()
-        if (copy.isEmpty()){
-            return (requestAverageProcessingTime * quantilePercent).toLong()
+        if (copy.size < 10){
+            return (requestAverageProcessingTime * 1.5).toLong()
         }
 
         val index = ((copy.size - 1) * quantilePercent).toInt().coerceIn(0, copy.size - 1)
