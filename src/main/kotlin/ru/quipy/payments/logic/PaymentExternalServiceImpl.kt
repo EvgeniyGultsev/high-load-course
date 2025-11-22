@@ -1,17 +1,21 @@
 package ru.quipy.payments.logic
 
+import io.netty.handler.timeout.ReadTimeoutException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
 import org.springframework.web.reactive.function.client.WebClient
 import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
-import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeoutException
 
 // Advice: always treat time as a Duration
@@ -31,15 +35,10 @@ class PaymentExternalSystemAdapterImpl(
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime.toMillis()
-    private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-
     private val ongoingWindow = OngoingWindow(parallelRequests, true)
-
-    private val responsesListSize = 1000
-    private val responses = LinkedBlockingDeque<Long>(responsesListSize)
+    private val dbScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -48,8 +47,10 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        dbScope.launch {
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
@@ -60,7 +61,6 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.acquire()
             var attempts = 0
             while (attempts < 5) {
-                //rateLimiter.tickSuspend()
                 attempts++
                 val body = webClient.post()
                     .uri(url)
@@ -82,8 +82,10 @@ class PaymentExternalSystemAdapterImpl(
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
                 }
 
                 if (!body.result && deadline - now() > requestAverageProcessingTime) {
@@ -95,55 +97,28 @@ class PaymentExternalSystemAdapterImpl(
             metricsCollector.failedRequestExternalInc(accountName)
 
             when (e) {
-                is TimeoutException, is SocketTimeoutException -> {
+                is TimeoutException, is SocketTimeoutException, is ReadTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        }
                     }
                 }
 
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = e.message)
+                        }
                     }
                 }
             }
         } finally {
             ongoingWindow.release()
         }
-    }
-
-    fun addResponseTime(executionTime: Long){
-        if (responses.size >= responsesListSize - 1) responses.pollFirst()
-        responses.offerLast(executionTime)
-    }
-
-    fun buildTimeout(deadline: Long, quantilePercent: Double): Long {
-        val remainingTime = deadline - now()
-        val minTimeout = requestAverageProcessingTime
-        val maxTimeout = if (remainingTime > minTimeout) remainingTime else minTimeout
-        
-        val timeout = countQuantileTime(quantilePercent).coerceIn(minTimeout, maxTimeout)
-        return (timeout * 1.5).toLong()
-    }
-
-    fun countQuantileTime(quantilePercent: Double): Long {
-        if (quantilePercent <= 0 || quantilePercent >= 1){
-            return Long.MAX_VALUE
-        }
-
-        val copy = responses.toList()
-        if (copy.isEmpty()){
-            return (requestAverageProcessingTime * quantilePercent).toLong()
-        }
-
-        val index = ((copy.size - 1) * quantilePercent).toInt().coerceIn(0, copy.size - 1)
-        val quantileTime = copy.sorted()[index]
-        metricsCollector.recordMaxRequestDuration(quantileTime, accountName)
-
-        return quantileTime
     }
 
     override fun price() = properties.price
