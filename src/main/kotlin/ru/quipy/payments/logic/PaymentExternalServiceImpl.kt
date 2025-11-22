@@ -1,6 +1,7 @@
 package ru.quipy.payments.logic
 
 import io.netty.handler.timeout.ReadTimeoutException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.reactor.awaitSingle
 import org.slf4j.LoggerFactory
 import org.springframework.web.reactive.function.client.WebClient
@@ -80,10 +81,6 @@ class PaymentExternalSystemAdapterImpl(
                         }
                         .bodyToMono(ExternalSysResponse::class.java)
                         .timeout(Duration.ofMillis(timeout))
-                        .retryWhen(
-                            Retry.backoff(3, Duration.ofMillis(50))
-                                .filter { it is IOException || it is PrematureCloseException || it is ReadTimeoutException }
-                        )
                         .awaitSingle()
 
                     val executionTime = System.currentTimeMillis() - startTime
@@ -111,17 +108,15 @@ class PaymentExternalSystemAdapterImpl(
                     val executionTime = System.currentTimeMillis() - startTime
                     addResponseTime(executionTime)
                     
-                    if (deadline - now() > requestAverageProcessingTime) {
+                    if (deadline - now() > requestAverageProcessingTime && attempts < 5) {
                         retryable = true
                         metricsCollector.incRetryCount(accountName)
+                        delay(50)
                     }
                     else{
                         throw e
                     }
                 }
-            }
-            if (retryable && attempts >= 5) {
-                 logger.warn("[$accountName] Payment failed after $attempts attempts for txId: $transactionId, payment: $paymentId")
             }
         } catch (e: Exception) {
             metricsCollector.failedRequestExternalInc(accountName)
