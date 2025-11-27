@@ -28,85 +28,59 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
-    private var avgTimeKeeper = AverageTimeKeeper()
+    // private var avgTimeKeeper = AverageTimeKeeper()
 
     private val paymentExecutor: ThreadPoolExecutor
 
-    private val paymentTaskQueue = LinkedBlockingQueue<Payment>()
-    private val backgroundWorkers = getMaxRateLimit()
+//    private val paymentTaskQueue = LinkedBlockingQueue<Payment>()
+//    private val backgroundWorkers = getMaxRateLimit()
 
     init {
         val queue = LinkedBlockingQueue<Runnable>(8000)
         metricsCollector.requestsQueueSizeRegister(queue);
 
         paymentExecutor = ThreadPoolExecutor(
-            50,
-            100,
-            0L,
-            TimeUnit.MILLISECONDS,
+            200,
+            1200,
+            60L,
+            TimeUnit.SECONDS,
             queue,
             NamedThreadFactory("payment-submission-executor"),
             CallerBlockingRejectedExecutionHandler()
-        ).apply {
-            repeat(backgroundWorkers) {
-                submit {
-                    while (!Thread.currentThread().isInterrupted) {
-                        try {
-                            val task = paymentTaskQueue.take()
-                            val taskStartedAt = now()
-                            processInternal(task)
-                            avgTimeKeeper.record(now() - taskStartedAt)
-                        } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        } catch (e: Exception) {
-                            logger.error("Error processing payment task", e)
-                        }
-                    }
-                }
-            }
-        }
+        )
     }
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        val averageProcessingTime = avgTimeKeeper.getAverage()
+//        val averageProcessingTime = avgTimeKeeper.getAverage()
+//
+//        val maxProcessingTime = averageProcessingTime * 1
+//
+//        val queueProcessingTime = (paymentTaskQueue.size + backgroundWorkers) * maxProcessingTime / backgroundWorkers
+//
+//        if (now() + queueProcessingTime > deadline) {
+//            logger.warn("Payment $paymentId for order $orderId not created (too many requests)")
+//            metricsCollector.status429RequestInc()
+//
+//            return null
+//        }
 
-        val maxProcessingTime = averageProcessingTime * 1
+        paymentExecutor.submit {
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
+            }
 
-        val queueProcessingTime = (paymentTaskQueue.size + backgroundWorkers) * maxProcessingTime / backgroundWorkers
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-        if (now() + queueProcessingTime > deadline) {
-            logger.warn("Payment $paymentId for order $orderId not created (too many requests)")
-            metricsCollector.status429RequestInc()
-
-            return null
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
 
-        paymentTaskQueue.put(Payment(orderId, amount, paymentId, deadline, createdAt))
         return createdAt
     }
 
-    private fun processInternal(payment: Payment){
-        val createdEvent = paymentESService.create {
-            it.create(
-                payment.paymentId,
-                payment.orderId,
-                payment.amount
-            )
-        }
-
-        logger.trace("Payment ${createdEvent.paymentId} for order $payment.orderId created.")
-
-        paymentService.submitPaymentRequest(payment.paymentId, payment.amount, payment.createdAt, payment.deadline)
-    }
-
-    private data class Payment(
-        val orderId: UUID,
-        val amount: Int,
-        val paymentId: UUID,
-        val deadline: Long,
-        val createdAt: Long
-    )
     fun getMaxRateLimit() = paymentService.getMaxRateLimit()
 }
