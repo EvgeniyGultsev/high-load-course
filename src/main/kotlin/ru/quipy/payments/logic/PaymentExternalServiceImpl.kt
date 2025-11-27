@@ -2,7 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -17,7 +16,6 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
 
 
@@ -37,6 +35,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val MAX_ATTEMPTS = 5
+    private val TIMEOUT = Duration.ofSeconds(30)
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
@@ -53,9 +52,6 @@ class PaymentExternalSystemAdapterImpl(
         .executor(Executors.newFixedThreadPool(100))
         .version(HttpClient.Version.HTTP_2)
         .build()
-
-    // private val responsesListSize = 1000
-    // private val responses = LinkedBlockingDeque<Long>(responsesListSize)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -101,20 +97,16 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // val timeout = getTimeout(deadline, 0.99)
         val request = HttpRequest
             .newBuilder()
-//            .timeout(Duration.ofMillis(timeout))
-//            .header("deadline", "$deadline")
-//            .header("timeout", "$timeout")
+            .timeout(TIMEOUT)
+            .header("deadline", "$deadline")
+            .header("timeout", "$TIMEOUT")
             .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
-        // val startTime = now()
         client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
-            // TODO разобраться почему response time зависают
-            // addResponseTime(now() - startTime)
 
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -162,32 +154,6 @@ class PaymentExternalSystemAdapterImpl(
             performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
         }
     }
-
-//    fun addResponseTime(executionTimeMillis: Long){
-//        if (responses.size >= responsesListSize - 1) responses.pollFirst()
-//        responses.offerLast(executionTimeMillis)
-//    }
-//
-//    fun getTimeout(deadline: Long, quantilePercent: Double): Long {
-//        return countQuantileTime(quantilePercent).coerceIn(requestAverageProcessingTime, deadline - now())
-//    }
-//
-//    fun countQuantileTime(quantilePercent: Double): Long {
-//        if (quantilePercent <= 0 || quantilePercent >= 1){
-//            return Long.MAX_VALUE
-//        }
-//
-//        val copy = responses.toList()
-//        if (copy.count() < 10){
-//            return (requestAverageProcessingTime * 1.2 * quantilePercent).toLong()
-//        }
-//
-//        val index = ((copy.size - 1) * quantilePercent).toInt().coerceIn(0, copy.size - 1)
-//        val quantileTime = copy.sorted()[index]
-//        metricsCollector.recordMaxRequestDuration(quantileTime, accountName)
-//
-//        return quantileTime
-//    }
 
     override fun price() = properties.price
 
