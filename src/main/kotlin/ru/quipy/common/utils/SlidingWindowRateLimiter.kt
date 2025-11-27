@@ -6,12 +6,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import ru.quipy.payments.logic.now
 import java.time.Duration
 import java.util.concurrent.Executors
 import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
@@ -33,9 +33,35 @@ class SlidingWindowRateLimiter(
         }
     }
 
-    fun tickBlocking() {
+    fun tickBlocking(timeout: Duration): Boolean {
+        val end = System.currentTimeMillis() + timeout.toMillis()
+        while (System.currentTimeMillis() <= end) {
+            if (tick()) return true
+            Thread.sleep(10)
+        }
+
+        return false
+    }
+
+    suspend fun tickSuspend(timeout: Duration) : Boolean {
+        val end = System.currentTimeMillis() + timeout.toMillis()
+        while (System.currentTimeMillis() <= end) {
+            if (tick()) return true
+            delay(10)
+        }
+
+        return false
+    }
+
+    fun tickBlocking(){
         while (!tick()) {
             Thread.sleep(10)
+        }
+    }
+
+    suspend fun tickSuspend(){
+        while (!tick()) {
+            delay(10)
         }
     }
 
