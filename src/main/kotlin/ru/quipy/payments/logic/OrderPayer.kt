@@ -30,12 +30,12 @@ class OrderPayer(
     private val paymentExecutor: ThreadPoolExecutor
 
     init {
-        val queue = LinkedBlockingQueue<Runnable>(16000)
+        val queue = LinkedBlockingQueue<Runnable>(20000)
         metricsCollector.requestsQueueSizeRegister(queue);
 
         paymentExecutor = ThreadPoolExecutor(
             50,
-            100,
+            50,
             60L,
             TimeUnit.SECONDS,
             queue,

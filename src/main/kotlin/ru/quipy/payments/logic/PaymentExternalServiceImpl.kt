@@ -3,6 +3,7 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -16,6 +17,8 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 
@@ -43,13 +46,23 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    //private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val ongoingWindow = OngoingWindow(parallelRequests, false)
 
-    //private val ongoingWindow = OngoingWindow(parallelRequests, true)
+    private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
+    private val httpExecutor = ThreadPoolExecutor(
+        httpThreadPoolSize,
+        httpThreadPoolSize,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(parallelRequests * 2),
+        Executors.defaultThreadFactory(),
+        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
+    )
 
-    private val client = HttpClient
-        .newBuilder()
-        .executor(Executors.newFixedThreadPool(64))
+    private val client: HttpClient = HttpClient.newBuilder()
+        .executor(httpExecutor)
+        .connectTimeout(Duration.ofMillis(1000L))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -65,8 +78,8 @@ class PaymentExternalSystemAdapterImpl(
 //        }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
         performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, 0)
+
     }
 
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
@@ -78,24 +91,8 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-//        if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
-//            metricsCollector.failedRequestInc(accountName)
-////            paymentESService.update(paymentId) {
-////                it.logProcessing(false, now(), transactionId, reason = "Rate limit exceed")
-////            }
-//            return
-//        }
-
-//        val timeToBlock = deadline - System.currentTimeMillis()
-//        val acquired = ongoingWindow.acquire(timeToBlock, TimeUnit.MILLISECONDS)
-//        if (!acquired) {
-//            logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
-//            metricsCollector.failedRequestInc(accountName)
-////            paymentESService.update(paymentId) {
-////                it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
-////            }
-//            return
-//        }
+        rateLimiter.tickBlocking()
+        ongoingWindow.acquire()
 
         val request = HttpRequest
             .newBuilder()
@@ -124,15 +121,14 @@ class PaymentExternalSystemAdapterImpl(
 
             if (body.result) {
                 metricsCollector.successfulRequestInc(accountName)
-                //ongoingWindow.release()
+                ongoingWindow.release()
             }
             else {
                 metricsCollector.incRetryCount(accountName)
-                //ongoingWindow.release()
+                ongoingWindow.release()
 
                 performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             }
-
         }.exceptionally { ex ->
             when (ex) {
                 is SocketTimeoutException -> {
@@ -150,8 +146,9 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             metricsCollector.incRetryCount(accountName)
-            //ongoingWindow.release()
             performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+        }.whenComplete { _, _ ->
+            ongoingWindow.release()
         }
     }
 
