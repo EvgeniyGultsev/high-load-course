@@ -7,6 +7,7 @@ import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
+import ru.quipy.domain.Event
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -20,6 +21,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import ru.quipy.common.utils.NamedThreadFactory
 
 
 // Advice: always treat time as a Duration
@@ -60,11 +62,37 @@ class PaymentExternalSystemAdapterImpl(
         CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
     )
 
+    // Dedicated executor for event sourcing updates to avoid blocking at high RPS
+    private val esUpdateExecutor = ThreadPoolExecutor(
+        50,
+        100,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(10000),
+        NamedThreadFactory("es-update-executor-${accountName}"),
+        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
+    )
+
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
         .connectTimeout(Duration.ofMillis(1000L))
         .version(HttpClient.Version.HTTP_2)
         .build()
+
+    // Async wrapper for event sourcing updates to prevent blocking
+    private fun <E : Event<PaymentAggregate>> updateESAsync(
+        paymentId: UUID, 
+        updateFn: (PaymentAggregateState) -> E
+    ) {
+        esUpdateExecutor.submit {
+            try {
+                paymentESService.update(paymentId) { updateFn(it) }
+                // Event is returned but we don't need to process it synchronously
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to update ES for payment $paymentId", e)
+            }
+        }
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -73,9 +101,9 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-//        paymentESService.update(paymentId) {
-//            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-//        }
+        updateESAsync(paymentId) {
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
         performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, 0)
@@ -85,9 +113,9 @@ class PaymentExternalSystemAdapterImpl(
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
         if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
             metricsCollector.failedRequestExternalInc(accountName)
-//            paymentESService.update(paymentId) {
-//                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
-//            }
+            updateESAsync(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
+            }
             return
         }
 
@@ -115,9 +143,9 @@ class PaymentExternalSystemAdapterImpl(
 
             // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
             // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-//            paymentESService.update(paymentId) {
-//                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-//            }
+            updateESAsync(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
 
             if (body.result) {
                 metricsCollector.successfulRequestInc(accountName)
@@ -133,15 +161,15 @@ class PaymentExternalSystemAdapterImpl(
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-//                    }
+                    updateESAsync(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    }
                 }
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(false, now(), transactionId, reason = ex.message)
-//                    }
+                    updateESAsync(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = ex.message)
+                    }
                 }
             }
 
