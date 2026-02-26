@@ -48,15 +48,15 @@ class OrderPayer(
         val createdAt = System.currentTimeMillis()
 
         paymentExecutor.submit {
-//            val createdEvent = paymentESService.create {
-//                it.create(
-//                    paymentId,
-//                    orderId,
-//                    amount
-//                )
-//            }
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
+            }
 
-            //logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }

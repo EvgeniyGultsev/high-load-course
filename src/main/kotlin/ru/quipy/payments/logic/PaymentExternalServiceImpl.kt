@@ -73,21 +73,28 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-//        paymentESService.update(paymentId) {
-//            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-//        }
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
         performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, 0)
 
     }
 
-    private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
+    private fun performPaymentAsync(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        transactionId: UUID,
+        attempt: Long
+    ) {
         if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
             metricsCollector.failedRequestExternalInc(accountName)
-//            paymentESService.update(paymentId) {
-//                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
-//            }
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
+            }
             return
         }
 
@@ -115,15 +122,14 @@ class PaymentExternalSystemAdapterImpl(
 
             // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
             // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-//            paymentESService.update(paymentId) {
-//                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-//            }
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
 
             if (body.result) {
                 metricsCollector.successfulRequestInc(accountName)
                 ongoingWindow.release()
-            }
-            else {
+            } else {
                 metricsCollector.incRetryCount(accountName)
                 ongoingWindow.release()
 
@@ -133,15 +139,16 @@ class PaymentExternalSystemAdapterImpl(
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-//                    }
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    }
                 }
+
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(false, now(), transactionId, reason = ex.message)
-//                    }
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = ex.message)
+                    }
                 }
             }
 
