@@ -43,13 +43,13 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    //private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
-    private val ongoingWindow = OngoingWindow(parallelRequests, true)
+    //private val ongoingWindow = OngoingWindow(parallelRequests, true)
 
     private val client = HttpClient
         .newBuilder()
-        .executor(Executors.newFixedThreadPool(100))
+        .executor(Executors.newFixedThreadPool(64))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -60,9 +60,9 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
+//        paymentESService.update(paymentId) {
+//            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+//        }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -72,30 +72,30 @@ class PaymentExternalSystemAdapterImpl(
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
         if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
             metricsCollector.failedRequestExternalInc(accountName)
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
-            }
+//            paymentESService.update(paymentId) {
+//                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
+//            }
             return
         }
 
-        if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
-            metricsCollector.failedRequestInc(accountName)
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Rate limit exceed")
-            }
-            return
-        }
+//        if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
+//            metricsCollector.failedRequestInc(accountName)
+////            paymentESService.update(paymentId) {
+////                it.logProcessing(false, now(), transactionId, reason = "Rate limit exceed")
+////            }
+//            return
+//        }
 
-        val timeToBlock = deadline - System.currentTimeMillis()
-        val acquired = ongoingWindow.acquire(timeToBlock, TimeUnit.MILLISECONDS)
-        if (!acquired) {
-            logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
-            metricsCollector.failedRequestInc(accountName)
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
-            }
-            return
-        }
+//        val timeToBlock = deadline - System.currentTimeMillis()
+//        val acquired = ongoingWindow.acquire(timeToBlock, TimeUnit.MILLISECONDS)
+//        if (!acquired) {
+//            logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
+//            metricsCollector.failedRequestInc(accountName)
+////            paymentESService.update(paymentId) {
+////                it.logProcessing(false, now(), transactionId, reason = "Semaphore timeout")
+////            }
+//            return
+//        }
 
         val request = HttpRequest
             .newBuilder()
@@ -118,17 +118,17 @@ class PaymentExternalSystemAdapterImpl(
 
             // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
             // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-            paymentESService.update(paymentId) {
-                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-            }
+//            paymentESService.update(paymentId) {
+//                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+//            }
 
             if (body.result) {
                 metricsCollector.successfulRequestInc(accountName)
-                ongoingWindow.release()
+                //ongoingWindow.release()
             }
             else {
                 metricsCollector.incRetryCount(accountName)
-                ongoingWindow.release()
+                //ongoingWindow.release()
 
                 performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             }
@@ -137,20 +137,20 @@ class PaymentExternalSystemAdapterImpl(
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
+//                    paymentESService.update(paymentId) {
+//                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+//                    }
                 }
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = ex.message)
-                    }
+//                    paymentESService.update(paymentId) {
+//                        it.logProcessing(false, now(), transactionId, reason = ex.message)
+//                    }
                 }
             }
 
             metricsCollector.incRetryCount(accountName)
-            ongoingWindow.release()
+            //ongoingWindow.release()
             performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
         }
     }
