@@ -7,8 +7,10 @@ import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
+import ru.quipy.domain.Event
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -29,6 +31,17 @@ class OrderPayer(
 
     private val paymentExecutor: ThreadPoolExecutor
 
+    // Dedicated executor for event sourcing updates to avoid blocking at high RPS
+    private val esUpdateExecutor = ThreadPoolExecutor(
+        50,
+        100,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(10000),
+        NamedThreadFactory("es-update-executor"),
+        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
+    )
+
     init {
         val queue = LinkedBlockingQueue<Runnable>(20000)
         metricsCollector.requestsQueueSizeRegister(queue);
@@ -44,19 +57,31 @@ class OrderPayer(
         )
     }
 
+    private fun createESAsync(
+        createFn: () -> Event<PaymentAggregate>
+    ) {
+        esUpdateExecutor.submit {
+            try {
+                createFn()
+            } catch (e: Exception) {
+                logger.error("Failed to create payment in ES", e)
+            }
+        }
+    }
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
         paymentExecutor.submit {
-           val createdEvent = paymentESService.create {
-               it.create(
-                   paymentId,
-                   orderId,
-                   amount
-                )
+            createESAsync {
+                paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
+                }
             }
-
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
