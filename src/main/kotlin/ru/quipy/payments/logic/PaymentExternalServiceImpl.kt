@@ -139,8 +139,26 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        rateLimiter.tickBlocking()
-        ongoingWindow.acquire()
+        val timeToBlock = deadline - System.currentTimeMillis()
+        val acquired = ongoingWindow.acquire(timeToBlock, TimeUnit.MILLISECONDS)
+        if (!acquired) {
+            logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
+            metricsCollector.failedRequestInc(accountName)
+            val currentTime = now()
+            dbScope.launch {
+                while (true) {
+                    try {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, currentTime, transactionId, reason = "Semaphore timeout")
+                        }
+                        break
+                    } catch (_: java.lang.IllegalArgumentException) {
+                        delay(10)
+                    }
+                }
+            }
+            return
+        }
 
         val request = HttpRequest
             .newBuilder()
@@ -228,9 +246,9 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             metricsCollector.incRetryCount(accountName)
-            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-        }.whenComplete { _, _ ->
             ongoingWindow.release()
+
+            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
         }
     }
 
