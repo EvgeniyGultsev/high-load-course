@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.OngoingWindow
@@ -28,7 +31,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val metricsCollector: MetricsCollector
+    private val metricsCollector: MetricsCollector,
+    private val dbScope: CoroutineScope
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -73,9 +77,25 @@ class PaymentExternalSystemAdapterImpl(
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-//        paymentESService.update(paymentId) {
-//            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-//        }
+        val startedAt = now()
+        dbScope.launch {
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            while (true) {
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(
+                            success = true,
+                            transactionId,
+                            startedAt,
+                            Duration.ofMillis(startedAt - paymentStartedAt)
+                        )
+                    }
+                    break
+                } catch (_: java.lang.IllegalArgumentException) {
+                    delay(10)
+                }
+            }
+        }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
         performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, 0)
@@ -85,9 +105,37 @@ class PaymentExternalSystemAdapterImpl(
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
         if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
             metricsCollector.failedRequestExternalInc(accountName)
-//            paymentESService.update(paymentId) {
-//                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded or max attempts reached")
-//            }
+            val currentTime = now()
+            dbScope.launch {
+                while (true) {
+                    try {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, currentTime, transactionId, reason = "Deadline exceeded or max attempts reached")
+                        }
+                        break
+                    } catch (_: java.lang.IllegalArgumentException) {
+                        delay(10)
+                    }
+                }
+            }
+            return
+        }
+
+        if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
+            metricsCollector.failedRequestInc(accountName)
+            val currentTime = now()
+            dbScope.launch {
+                while (true) {
+                    try {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, currentTime, transactionId, reason = "Rate limit exceed")
+                        }
+                        break
+                    } catch (_: java.lang.IllegalArgumentException) {
+                        delay(10)
+                    }
+                }
+            }
             return
         }
 
@@ -115,9 +163,21 @@ class PaymentExternalSystemAdapterImpl(
 
             // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
             // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-//            paymentESService.update(paymentId) {
-//                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-//            }
+            val currentTime = now()
+            val result = body.result
+            val message = body.message
+            dbScope.launch {
+                while (true) {
+                    try {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(result, currentTime, transactionId, reason = message)
+                        }
+                        break
+                    } catch (_: java.lang.IllegalArgumentException) {
+                        delay(10)
+                    }
+                }
+            }
 
             if (body.result) {
                 metricsCollector.successfulRequestInc(accountName)
@@ -133,15 +193,37 @@ class PaymentExternalSystemAdapterImpl(
             when (ex) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-//                    }
+                    metricsCollector.failedRequestExternalInc(accountName)
+                    val currentTime = now()
+                    dbScope.launch {
+                        while (true) {
+                            try {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, currentTime, transactionId, reason = "Request timeout.")
+                                }
+                                break
+                            } catch (_: java.lang.IllegalArgumentException) {
+                                delay(10)
+                            }
+                        }
+                    }
                 }
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-//                    paymentESService.update(paymentId) {
-//                        it.logProcessing(false, now(), transactionId, reason = ex.message)
-//                    }
+                    metricsCollector.failedRequestExternalInc(accountName)
+                    val currentTime = now()
+                    dbScope.launch {
+                        while (true) {
+                            try {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, currentTime, transactionId, reason = ex.message)
+                                }
+                                break
+                            } catch (_: java.lang.IllegalArgumentException) {
+                                delay(10)
+                            }
+                        }
+                    }
                 }
             }
 
