@@ -19,6 +19,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -41,8 +42,9 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
-    private val MAX_ATTEMPTS = 5
-    private val TIMEOUT = Duration.ofSeconds(30)
+    private val MAX_ATTEMPTS = 2
+    private val HEDGE_DELAY = 160L
+    private val TIMEOUT = Duration.ofMillis(1500)
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
@@ -53,6 +55,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests, false)
 
+    private val scheduler = Executors.newScheduledThreadPool(100)
     private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
     private val httpExecutor = ThreadPoolExecutor(
         httpThreadPoolSize,
@@ -66,7 +69,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(1000L))
+        //.connectTimeout(Duration.ofMillis(1000L))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -98,29 +101,11 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-        performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, 0)
+        performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId)
 
     }
 
-    private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
-        if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
-            metricsCollector.failedRequestExternalInc(accountName)
-            val currentTime = now()
-            dbScope.launch {
-                while (true) {
-                    try {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, currentTime, transactionId, reason = "Deadline exceeded or max attempts reached")
-                        }
-                        break
-                    } catch (_: java.lang.IllegalArgumentException) {
-                        delay(10)
-                    }
-                }
-            }
-            return
-        }
-
+    private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID) {
         if (!rateLimiter.tickBlocking(Duration.ofMillis(deadline - now()))) {
             metricsCollector.failedRequestInc(accountName)
             val currentTime = now()
@@ -160,17 +145,25 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val request = HttpRequest
-            .newBuilder()
-            .timeout(TIMEOUT)
-            .header("deadline", "$deadline")
-            .header("timeout", "$TIMEOUT")
-            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
-            .POST(HttpRequest.BodyPublishers.noBody())
-            .build()
+        val futures = mutableListOf<CompletableFuture<HttpResponse<String>>>()
 
-        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+        var request = makeRequest(transactionId, paymentId, amount)
+        futures.add(client.sendAsync(request, HttpResponse.BodyHandlers.ofString()))
 
+        for (i in 1..MAX_ATTEMPTS) {
+            scheduler.schedule({
+                if (futures.any { it.isDone }) return@schedule
+
+                request = makeRequest(transactionId, paymentId, amount)
+                futures.add(client.sendAsync(request, HttpResponse.BodyHandlers.ofString()))
+            }, HEDGE_DELAY * i, TimeUnit.MILLISECONDS)
+        }
+
+        CompletableFuture.anyOf(*futures.toTypedArray())
+            .thenApply { winner ->
+                winner as? HttpResponse<String> ?: throw RuntimeException("No response received")
+            }
+        .thenApply { response ->
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
             } catch (e: Exception) {
@@ -204,8 +197,6 @@ class PaymentExternalSystemAdapterImpl(
             else {
                 metricsCollector.incRetryCount(accountName)
                 ongoingWindow.release()
-
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
             }
         }.exceptionally { ex ->
             when (ex) {
@@ -245,11 +236,19 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
-            metricsCollector.incRetryCount(accountName)
+            // metricsCollector.incRetryCount(accountName)
             ongoingWindow.release()
-
-            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
         }
+    }
+
+    fun makeRequest(transactionId: UUID, paymentId: UUID, amount: Int): HttpRequest{
+        return HttpRequest
+            .newBuilder()
+            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+            .timeout(TIMEOUT)
+            .header("x-idempotency-key", transactionId.toString())
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build()
     }
 
     override fun price() = properties.price
