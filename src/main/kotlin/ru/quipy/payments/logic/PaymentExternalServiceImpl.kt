@@ -19,6 +19,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -41,7 +42,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
-    private val MAX_ATTEMPTS = 5
     private val TIMEOUT = Duration.ofSeconds(30)
 
     private val serviceName = properties.serviceName
@@ -98,19 +98,19 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-        performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, 0)
+        performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId)
 
     }
 
-    private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
-        if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
+    private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID) {
+        if (now() + requestAverageProcessingTime > deadline) {
             metricsCollector.failedRequestExternalInc(accountName)
             val currentTime = now()
             dbScope.launch {
                 while (true) {
                     try {
                         paymentESService.update(paymentId) {
-                            it.logProcessing(false, currentTime, transactionId, reason = "Deadline exceeded or max attempts reached")
+                            it.logProcessing(false, currentTime, transactionId, reason = "Deadline exceeded")
                         }
                         break
                     } catch (_: java.lang.IllegalArgumentException) {
@@ -169,7 +169,9 @@ class PaymentExternalSystemAdapterImpl(
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
-        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+        val future: CompletableFuture<HttpResponse<String>> = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        
+        future.thenApply { response ->
 
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -199,14 +201,10 @@ class PaymentExternalSystemAdapterImpl(
 
             if (body.result) {
                 metricsCollector.successfulRequestInc(accountName)
-                ongoingWindow.release()
+            } else {
+                metricsCollector.failedRequestExternalInc(accountName)
             }
-            else {
-                metricsCollector.incRetryCount(accountName)
-                ongoingWindow.release()
-
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
-            }
+            ongoingWindow.release()
         }.exceptionally { ex ->
             when (ex) {
                 is SocketTimeoutException -> {
@@ -244,11 +242,7 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-
-            metricsCollector.incRetryCount(accountName)
             ongoingWindow.release()
-
-            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
         }
     }
 
