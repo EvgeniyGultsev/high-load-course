@@ -7,7 +7,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
@@ -22,8 +21,13 @@ import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 
 
 // Advice: always treat time as a Duration
@@ -43,6 +47,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private val TIMEOUT = Duration.ofSeconds(30)
+    private val hedgeDelayMs = 1000L // Delay before sending hedge request
+    private val requestTimeoutMs = 30000L // Request timeout in milliseconds
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
@@ -51,7 +57,33 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests, false)
+    private val semaphore = Semaphore(parallelRequests, false)
+    
+    // Metrics
+    private val hedgeTriggeredCounter = Counter.builder("hedge_triggered_total")
+        .description("Number of hedge requests triggered")
+        .tags("account", accountName)
+        .register(Metrics.globalRegistry)
+    
+    private val paymentRequestsCounter = Counter.builder("payment_requests_total")
+        .description("Number of payment requests")
+        .tags("account", accountName)
+        .register(Metrics.globalRegistry)
+    
+    private val requestLatency = Timer.builder("request_latency")
+        .description("Request latency in milliseconds")
+        .tags("account", accountName)
+        .register(Metrics.globalRegistry)
+    
+    private val paymentSuccessCounter = Counter.builder("payment_success_total")
+        .description("Number of successful payments")
+        .tags("account", accountName)
+        .register(Metrics.globalRegistry)
+    
+    private val paymentErrorCounter = Counter.builder("payment_error_total")
+        .description("Number of payment errors")
+        .tags("account", accountName)
+        .register(Metrics.globalRegistry)
 
     private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
     private val httpExecutor = ThreadPoolExecutor(
@@ -64,11 +96,13 @@ class PaymentExternalSystemAdapterImpl(
         CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
     )
 
-    private val client: HttpClient = HttpClient.newBuilder()
+    private val http2Client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
         .connectTimeout(Duration.ofMillis(1000L))
         .version(HttpClient.Version.HTTP_2)
         .build()
+    
+    private val scheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(1)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -140,7 +174,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val timeToBlock = deadline - System.currentTimeMillis()
-        val acquired = ongoingWindow.acquire(timeToBlock, TimeUnit.MILLISECONDS)
+        val acquired = semaphore.tryAcquire(timeToBlock, TimeUnit.MILLISECONDS)
         if (!acquired) {
             logger.warn("[$accountName] Timeout acquiring semaphore for payment $paymentId")
             metricsCollector.failedRequestInc(accountName)
@@ -160,90 +194,90 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val request = HttpRequest
-            .newBuilder()
-            .timeout(TIMEOUT)
-            .header("deadline", "$deadline")
-            .header("timeout", "$TIMEOUT")
-            .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
-            .POST(HttpRequest.BodyPublishers.noBody())
-            .build()
-
-        val future: CompletableFuture<HttpResponse<String>> = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        val idempotencyKey = UUID.randomUUID().toString()
         
-        future.thenApply { response ->
-
-            val body = try {
-                mapper.readValue(response.body(), ExternalSysResponse::class.java)
-            } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-            }
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-            val currentTime = now()
-            val result = body.result
-            val message = body.message
-            dbScope.launch {
-                while (true) {
-                    try {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(result, currentTime, transactionId, reason = message)
-                        }
-                        break
-                    } catch (_: java.lang.IllegalArgumentException) {
-                        delay(10)
-                    }
-                }
-            }
-
-            if (body.result) {
-                metricsCollector.successfulRequestInc(accountName)
-            } else {
-                metricsCollector.failedRequestExternalInc(accountName)
-            }
-            ongoingWindow.release()
-        }.exceptionally { ex ->
-            when (ex) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-                    metricsCollector.failedRequestExternalInc(accountName)
-                    val currentTime = now()
-                    dbScope.launch {
-                        while (true) {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, currentTime, transactionId, reason = "Request timeout.")
-                                }
-                                break
-                            } catch (_: java.lang.IllegalArgumentException) {
-                                delay(10)
-                            }
-                        }
-                    }
-                }
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-                    metricsCollector.failedRequestExternalInc(accountName)
-                    val currentTime = now()
-                    dbScope.launch {
-                        while (true) {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, currentTime, transactionId, reason = ex.message)
-                                }
-                                break
-                            } catch (_: java.lang.IllegalArgumentException) {
-                                delay(10)
-                            }
-                        }
-                    }
-                }
-            }
-            ongoingWindow.release()
+        fun createRequest(): HttpRequest {
+            return HttpRequest
+                .newBuilder()
+                .header("x-idempotency-key", idempotencyKey)
+                .timeout(Duration.ofMillis(requestTimeoutMs))
+                .header("deadline", "$deadline")
+                .header("timeout", "$TIMEOUT")
+                .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build()
         }
+
+        val startTime = now()
+
+        val future1 = http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString())
+        val hedgeFuture = CompletableFuture<HttpResponse<String>?>()
+
+        scheduler.schedule({
+            if (!future1.isDone) {
+                logger.info("[$accountName] Hedge triggered for payment $paymentId")
+                hedgeTriggeredCounter.increment()
+                http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString())
+                    .thenAccept { hedgeFuture.complete(it) }
+                    .exceptionally { ex ->
+                        hedgeFuture.completeExceptionally(ex)
+                        null
+                    }
+            } else {
+                hedgeFuture.complete(null)
+            }
+        }, hedgeDelayMs, TimeUnit.MILLISECONDS)
+
+        CompletableFuture.anyOf(future1, hedgeFuture)
+            .thenApply { winner ->
+                winner as? HttpResponse<String> ?: throw RuntimeException("No response received")
+            }
+            .thenApply { response ->
+
+                val body = try {
+                    mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                }
+
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                paymentRequestsCounter.increment()
+                requestLatency.record(now() - startTime, TimeUnit.MILLISECONDS)
+
+                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
+
+                if (body.result) {
+                    paymentSuccessCounter.increment()
+                    semaphore.release()
+                } else {
+                    paymentErrorCounter.increment()
+                    semaphore.release()
+                }
+            }.exceptionally { ex ->
+                when (ex) {
+                    is SocketTimeoutException -> {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        }
+                    }
+                    else -> {
+                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = ex.message)
+                        }
+                    }
+                }
+                requestLatency.record(now() - startTime, TimeUnit.MILLISECONDS)
+                semaphore.release()
+                null
+            }
     }
 
     override fun price() = properties.price

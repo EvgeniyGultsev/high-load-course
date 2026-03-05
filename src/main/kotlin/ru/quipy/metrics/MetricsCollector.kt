@@ -58,15 +58,6 @@ class MetricsCollector {
                 .register(Metrics.globalRegistry)
     }
 
-    fun incRetryCount(account: String) {
-        Counter
-            .builder("external_system_retry_counter")
-            .description("Number of retried failed external requests")
-            .tags("account", account)
-            .register(Metrics.globalRegistry)
-            .increment()
-    }
-
     fun recordMaxRequestDuration(durationMs: Long, account: String) {
         Timer
             .builder("request_max_duration")
