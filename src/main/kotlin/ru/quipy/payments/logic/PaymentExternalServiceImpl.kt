@@ -42,8 +42,8 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
-    private val MAX_ATTEMPTS = 2
-    private val HEDGE_DELAY = 160L
+    private val MAX_ATTEMPTS = 3
+    private val HEDGE_DELAY = 100L
     private val TIMEOUT = Duration.ofMillis(1500)
 
     private val serviceName = properties.serviceName
