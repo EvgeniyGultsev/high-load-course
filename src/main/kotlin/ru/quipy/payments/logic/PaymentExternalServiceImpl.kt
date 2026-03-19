@@ -6,12 +6,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.metrics.MetricsCollector
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.http.HttpClient
@@ -52,6 +56,20 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests, false)
+
+    private val circuitBreaker = CircuitBreaker.of(
+        accountName,
+        CircuitBreakerConfig.custom()
+            .failureRateThreshold(50f)
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .permittedNumberOfCallsInHalfOpenState(10)
+            .slidingWindowSize((rateLimitPerSec * 4).coerceAtLeast(50))
+            .minimumNumberOfCalls(((rateLimitPerSec * 4).coerceAtLeast(50) * 0.2).toInt().coerceAtLeast(10))
+            .slowCallDurationThreshold(Duration.ofSeconds(25))
+            .slowCallRateThreshold(80f)
+            .recordExceptions(IOException::class.java, SocketTimeoutException::class.java)
+            .build()
+    )
 
     private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
     private val httpExecutor = ThreadPoolExecutor(
@@ -169,7 +187,9 @@ class PaymentExternalSystemAdapterImpl(
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
-        client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).thenApply { response ->
+        circuitBreaker.decorateCompletionStage {
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        }.get().thenApply { response ->
 
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -209,6 +229,25 @@ class PaymentExternalSystemAdapterImpl(
             }
         }.exceptionally { ex ->
             when (ex) {
+                is CallNotPermittedException -> {
+                    logger.warn("[$accountName] Circuit breaker open for payment $paymentId, txId: $transactionId")
+                    metricsCollector.failedRequestExternalInc(accountName)
+                    val currentTime = now()
+                    dbScope.launch {
+                        while (true) {
+                            try {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, currentTime, transactionId, reason = "Circuit breaker open")
+                                }
+                                break
+                            } catch (_: IllegalArgumentException) {
+                                delay(10)
+                            }
+                        }
+                    }
+                    ongoingWindow.release()
+                    return@exceptionally
+                }
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
                     metricsCollector.failedRequestExternalInc(accountName)
