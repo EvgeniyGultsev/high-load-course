@@ -1,6 +1,8 @@
 package ru.quipy.config
 
 import jakarta.annotation.PostConstruct
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -8,11 +10,13 @@ import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
 import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingServiceFactory
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.PaymentAggregateState
 import ru.quipy.streams.AggregateEventStreamManager
 import java.util.*
+import java.util.concurrent.Executors
 
 
 /**
@@ -51,6 +55,12 @@ class EventSourcingLibConfiguration {
      */
     @Bean
     fun paymentsEsService() = eventSourcingServiceFactory.create<UUID, PaymentAggregate, PaymentAggregateState>()
+
+    @Bean
+    fun dbScope(): CoroutineScope {
+        val dbThreadPool = Executors.newFixedThreadPool(200, NamedThreadFactory("db-executor"))
+        return CoroutineScope(dbThreadPool.asCoroutineDispatcher())
+    }
 
     @PostConstruct
     fun init() {
