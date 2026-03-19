@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
-    private val MAX_ATTEMPTS = 10
+    //private val MAX_ATTEMPTS = 10
     private val TIMEOUT = Duration.ofMillis(5000)
 
     private val serviceName = properties.serviceName
@@ -124,7 +124,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, transactionId: UUID, attempt: Long) {
-        if (now() + requestAverageProcessingTime > deadline || attempt >= MAX_ATTEMPTS) {
+        if (now() + requestAverageProcessingTime > deadline) { //|| attempt >= MAX_ATTEMPTS) {
             metricsCollector.failedRequestExternalInc(accountName)
             val currentTime = now()
             dbScope.launch {
