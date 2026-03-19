@@ -25,6 +25,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -45,8 +46,8 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
-    private val MAX_ATTEMPTS = 5
-    private val TIMEOUT = Duration.ofSeconds(30)
+    private val MAX_ATTEMPTS = 10
+    private val TIMEOUT = Duration.ofMillis(5000)
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
@@ -61,11 +62,11 @@ class PaymentExternalSystemAdapterImpl(
         accountName,
         CircuitBreakerConfig.custom()
             .failureRateThreshold(50f)
-            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .waitDurationInOpenState(Duration.ofSeconds(5))
             .permittedNumberOfCallsInHalfOpenState(10)
             .slidingWindowSize((rateLimitPerSec * 4).coerceAtLeast(50))
             .minimumNumberOfCalls(((rateLimitPerSec * 4).coerceAtLeast(50) * 0.2).toInt().coerceAtLeast(10))
-            .slowCallDurationThreshold(Duration.ofSeconds(25))
+            .slowCallDurationThreshold(Duration.ofSeconds(2))
             .slowCallRateThreshold(80f)
             .recordExceptions(IOException::class.java, SocketTimeoutException::class.java)
             .build()
@@ -84,9 +85,11 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(1000L))
+        .connectTimeout(TIMEOUT)
         .version(HttpClient.Version.HTTP_2)
         .build()
+
+    private val retryScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(8)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -225,7 +228,11 @@ class PaymentExternalSystemAdapterImpl(
                 metricsCollector.incRetryCount(accountName)
                 ongoingWindow.release()
 
-                performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+                retryScheduler.schedule(
+                    {performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)},
+                    computeBackoff(attempt),
+                    TimeUnit.MILLISECONDS
+                )
             }
         }.exceptionally { ex ->
             when (ex) {
@@ -246,7 +253,6 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
                     ongoingWindow.release()
-                    return@exceptionally
                 }
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
@@ -287,8 +293,20 @@ class PaymentExternalSystemAdapterImpl(
             metricsCollector.incRetryCount(accountName)
             ongoingWindow.release()
 
-            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)
+            retryScheduler.schedule(
+                {performPaymentAsync(paymentId, amount, paymentStartedAt, deadline, transactionId, attempt + 1)},
+                computeBackoff(attempt),
+                TimeUnit.MILLISECONDS
+            )
         }
+    }
+
+    private fun computeBackoff(attempt: Long): Long {
+        val baseDelay = 500L
+        val maxDelay = 4_000L
+
+        val delay = baseDelay * (1L shl attempt.coerceAtMost(10).toInt())
+        return delay.coerceAtMost(maxDelay)
     }
 
     override fun price() = properties.price
